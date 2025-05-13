@@ -47,6 +47,10 @@ pub contract Lending {
     fn CLOSE_FACTOR() -> u128 { (UNIT() * 50) / 100 } // 50 %
     #[contract_library_method]
     fn LIQ_RESERVE_SHARE() -> u128 { (UNIT() * 5) / 100 } // 5%
+    #[contract_library_method]
+    fn KINK() -> u128 { (UNIT() * 80) / 100 } // 80%
+    #[contract_library_method]
+    fn RESERVE_FEE() -> u128 { (UNIT() * 10) / 100 } // 10 %
 
     // Storage structure, containing all storage, and specifying what slots they use.
     #[storage]
@@ -55,7 +59,6 @@ pub contract Lending {
         base_token: PublicImmutable<AztecAddress, Context>,
 
         // Public Mutables
-        reserve_fee: PublicMutable<u128, Context>,
         admin: PublicMutable<AztecAddress, Context>,
 
         collaterals: Map<AztecAddress, PublicMutable<Asset, Context>, Context>,
@@ -68,7 +71,10 @@ pub contract Lending {
         current_supply_index: PublicMutable<u128, Context>,
         last_update_ts: PublicMutable<u64, Context>,
         available_base: PublicMutable<u128, Context>,
-        reserve: PublicMutable<u128, Context>,
+
+        base_rate_per_sec: PublicMutable<u128, Context>,
+        excess_rate_per_sec: PublicMutable<u128, Context>,
+
         balances: Map<Field, PublicMutable<Balance, Context>, Context>, // secret based balance, only public
     }
 
@@ -83,7 +89,8 @@ pub contract Lending {
 
         storage.admin.write(context.msg_sender());
 
-        storage.reserve_fee.write((UNIT() * 15) / 100); // 15% on interests
+        storage.base_rate_per_sec.write(5703964255); // == 18 percent per year
+        storage.excess_rate_per_sec.write(110910416072); // == MAX 83 % bor rate at full capacity
         storage.current_debt_index.write(UNIT()); // Initialize debt index at 1
         storage.current_supply_index.write(UNIT()); // Initialize supply index at 1
         storage.last_update_ts.write(context.timestamp()); // Initialize ts now
@@ -122,7 +129,7 @@ pub contract Lending {
     }
 
     #[public]
-    fn withdraw_base_reserve(to: AztecAddress) {
+    fn withdraw_base_reserve(to: AztecAddress) { //todo: accrue ?
         assert(context.msg_sender() == storage.admin.read());
         let base_token = storage.base_token.read();
         let available_base = storage.available_base.read();
@@ -130,6 +137,17 @@ pub contract Lending {
         let bal = Token::at(base_token).balance_of_public(context.this_address()).view(&mut context);
 
         let _ = Token::at(base_token).transfer_in_public(context.this_address(), to, bal - available_base, 0).call(&mut context);
+    }
+
+    #[public]
+    fn set_rate_per_sec(rps: u128, excess_rps: u128) {
+        assert(context.msg_sender() == storage.admin.read());
+        let _ = Lending::at(context.this_address()).accrue_interest().call(&mut context);
+
+        assert(rps < 31688690306); //TODO
+
+        storage.base_rate_per_sec.write(rps);
+        storage.excess_rate_per_sec.write(excess_rps);
     }
 
     /* 
@@ -146,12 +164,13 @@ pub contract Lending {
         if delta > 0 {
             let total_debt = storage.total_debt.read();
 
-            let BASE_RATE: u128 = 100000000;
+            let RATE_PER_SEC: u128 = storage.base_rate_per_sec.read();
 
-            // TODO COMPUTE A BORROW RATE
             let utilization_rate = (total_debt * UNIT()) / (total_debt + storage.available_base.read());
-            let borrow_rate_per_second = BASE_RATE * utilization_rate;
-            //TODO 
+            let borrow_rate_per_second = if(utilization_rate > KINK()) { 
+                let base_rate_per_sec = (RATE_PER_SEC * KINK()) / UNIT();
+                base_rate_per_sec + storage.excess_rate_per_sec.read() * (utilization_rate - KINK())
+             } else { RATE_PER_SEC * utilization_rate };
 
             let interest_factor = borrow_rate_per_second * delta as u128;
 
@@ -306,7 +325,6 @@ pub contract Lending {
     /*
         INTERNAL
     */
-//todo total debt with accrued, hard to predict
     #[public]
     #[internal]
     fn _liquidate(
@@ -476,7 +494,7 @@ pub contract Lending {
         let mut balance = balance_slot.read();
         let mut current_balance = if balance.amount > 0 {(balance.amount * current_supply_index) / balance.last_index } else {0};
 
-        let reserve_fee = (storage.reserve_fee.read() * (current_balance - balance.amount)) / UNIT();
+        let reserve_fee = (RESERVE_FEE() * (current_balance - balance.amount)) / UNIT();
 
         current_balance = current_balance + to_add - reserve_fee;
 
