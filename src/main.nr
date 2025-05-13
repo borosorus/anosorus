@@ -19,7 +19,6 @@ mod asset;
 use dep::aztec::macros::aztec;
 //TODO ASSUMING 8 decimals
 
-//TODO think about utility of loan_exists
 #[aztec]
 pub contract Lending {
     use dep::aztec::prelude::{AztecAddress, Map, PublicMutable, PublicImmutable};
@@ -38,6 +37,17 @@ pub contract Lending {
     use dep::aztec::protocol_types::traits::{FromField, ToField};
     use dep::aztec::hash::compute_secret_hash;
 
+    #[contract_library_method]
+    fn MIN_DEBT() -> u128 { 20000000000 } // 200 USD
+    #[contract_library_method]
+    fn UNIT() -> u128 { 100000000 }
+    #[contract_library_method]
+    fn LIQUIDATION_BONUS() -> u128 { 110000000 }
+    #[contract_library_method]
+    fn CLOSE_FACTOR() -> u128 { 50000000 }
+    #[contract_library_method]
+    fn LIQ_RESERVE_SHARE() -> u128 { 5000000 } // 5%
+
     // Storage structure, containing all storage, and specifying what slots they use.
     #[storage]
     struct Storage<Context> {
@@ -49,10 +59,9 @@ pub contract Lending {
         admin: PublicMutable<AztecAddress, Context>,
 
         collaterals: Map<AztecAddress, PublicMutable<Asset, Context>, Context>,
-        collateral_is_active: Map<AztecAddress, PublicMutable<bool, Context>, Context>,
+        collateral_reserve: Map<AztecAddress, PublicMutable<u128, Context>, Context>,
 
         loans: Map<Field, PublicMutable<Loan, Context>, Context>, // secret based loan
-        loan_exists: Map<Field, PublicMutable<bool, Context>, Context>,
 
         total_debt: PublicMutable<u128, Context>,
         current_index: PublicMutable<u128, Context>,
@@ -83,16 +92,40 @@ pub contract Lending {
     #[public]
     fn add_collateral(address: AztecAddress, oracle: AztecAddress, ltv: u128) {
         assert(context.msg_sender() == storage.admin.read());
-        let collateral = Asset { oracle: oracle, ltv: ltv };
+        assert(ltv < UNIT());
+
+        let collateral = Asset { oracle: oracle, ltv: ltv, active: true };
         storage.collaterals.at(address).write(collateral);
-        storage.collateral_is_active.at(address).write(true);
     }
 
     #[public]
     fn set_collateral_state(address: AztecAddress) {
         assert(context.msg_sender() == storage.admin.read());
-        let collateral_state_slot = storage.collateral_is_active.at(address);
-        collateral_state_slot.write(!collateral_state_slot.read());
+        let collat_slot = storage.collaterals.at(address);
+        let mut collateral = collat_slot.read();
+        collateral.active = !collateral.active;
+        collat_slot.write(collateral);
+    }
+
+    #[public]
+    fn withdraw_collateral_reserve(address: AztecAddress, to: AztecAddress) {
+        assert(context.msg_sender() == storage.admin.read());
+        let reserve_slot = storage.collateral_reserve.at(address);
+
+        let _ = Token::at(address).transfer_in_public(context.this_address(), to, reserve_slot.read(), 0).call(&mut context);
+
+        reserve_slot.write(0);
+    }
+
+    #[public]
+    fn withdraw_base_reserve(to: AztecAddress) {
+        assert(context.msg_sender() == storage.admin.read());
+        let base_token = storage.base_token.read();
+        let available_base = storage.available_base.read();
+
+        let bal = Token::at(base_token).balance_of_public(context.this_address()).view(&mut context);
+
+        let _ = Token::at(base_token).transfer_in_public(context.this_address(), to, bal - available_base, 0).call(&mut context);
     }
 
     /* 
@@ -283,23 +316,33 @@ pub contract Lending {
         assert(loan.collateral == collateral);
 
         loan.debt = (loan.debt * current_index) / loan.last_index - debt;
+        loan.last_index = current_index;
 
         let collateral_asset = storage.collaterals.at(collateral).read();
         let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
 
         assert(!((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv));
-        loan.debt -= debt;
-        loan.collateral_amount -= collateral_amount;
 
-        // Repay all or make it healthy
-        if(loan.debt != 0){
+        let collateral_eq = (debt * LIQUIDATION_BONUS()) / collateral_price;
+        loan.collateral_amount -= collateral_eq;
+
+        let max_debt_to_repay = (loan.debt * CLOSE_FACTOR()) / UNIT();
+
+        if((loan.debt - max_debt_to_repay) < MIN_DEBT()) {
+            assert(debt >= loan.debt);
+            loan.debt = 0;
+        } else {
+            assert(debt <= max_debt_to_repay);
+            loan.debt -= debt;
             assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
         }
 
-        //TODO define liquidation bonus both and reserve
+        let reserve_share = (debt * LIQ_RESERVE_SHARE()) / collateral_price;
+        let actual_share = collateral_amount - collateral_eq;
+        assert(actual_share >= reserve_share);
 
-        let collateral_eq = (debt * LIQUIDATION_BONUS()) / collateral_price;
-        assert(collateral_amount <= collateral_eq);
+        let coll_res_slot = storage.collateral_reserve.at(collateral);
+        coll_res_slot.write(coll_res_slot.read() + actual_share);
 
         loan_slot.write(loan);
     }
@@ -320,17 +363,18 @@ pub contract Lending {
         let mut loan = loan_slot.read();
 
         loan.debt = (loan.debt * current_index) / loan.last_index - debt;
+        loan.last_index = current_index;
+
+        assert( (loan.debt >= MIN_DEBT()) | (loan.debt == 0) );
 
         if(collateral.to_field() != 0) {
             assert(loan.collateral == collateral);
 
             loan.collateral_amount -= collateral_out_amount;
             if(loan.debt > 0) {
-
                 let collateral_asset = storage.collaterals.at(collateral).read();
                 let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
                 assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
-
             }
         }
 
@@ -347,40 +391,41 @@ pub contract Lending {
         debt_amount: u128,
         loan_id: Field,
     ) {
-        assert(storage.collateral_is_active.at(collateral).read());
+        let collateral_asset = storage.collaterals.at(collateral).read();
+
+        assert(collateral_asset.active);
         assert(base_token == storage.base_token.read());
 
         let current_index = Lending::at(context.this_address()).accrue_interest().call(&mut context);
 
-        let loan_exists = storage.loan_exists.at(loan_id).read();
+        let loan_slot = storage.loans.at(loan_id);
+        let mut loan = loan_slot.read();
 
-        if(loan_exists) {
-            let loan_slot = storage.loans.at(loan_id);
-            let mut loan = loan_slot.read();
-
+        if( (loan.debt > 0) | (loan.collateral_amount > 0) ) {
             assert(loan.collateral == collateral);
 
             loan.debt = ((loan.debt * current_index) / loan.last_index) + debt_amount;
+            loan.last_index = current_index;
+
             loan.collateral_amount += collateral_amount;
 
-                let collateral_asset = storage.collaterals.at(collateral).read();
-                let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
-                assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
+            let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
+            assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
 
             loan_slot.write(loan);
 
         } else {
-            let mut loan = Loan {collateral: collateral, collateral_amount: collateral_amount, debt: debt_amount, last_index: current_index};
+            assert(debt_amount >= MIN_DEBT());
 
-                let collateral_asset = storage.collaterals.at(collateral).read();
-                let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
-                assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
+            loan = Loan {collateral: collateral, collateral_amount: collateral_amount, debt: debt_amount, last_index: current_index};
+
+            let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
+            assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
 
             storage.loans.at(loan_id).write(loan);
-            storage.loan_exists.at(loan_id).write(true);
         }
 
-        storage.available_base.write(storage.available_base.read() - debt_amount); // TODO check not more than available ? or fails if not
+        storage.available_base.write(storage.available_base.read() - debt_amount);
         storage.total_debt.write(storage.total_debt.read() + debt_amount);
     }
 
@@ -434,11 +479,4 @@ pub contract Lending {
 
         storage.available_base.write(storage.available_base.read() + to_add - to_sub);
     }
-
-    #[contract_library_method]
-    fn UNIT() -> u128 { 100000000 }
-    #[contract_library_method]
-    fn LIQUIDATION_BONUS() -> u128 { 110000000 }
-
-
 }

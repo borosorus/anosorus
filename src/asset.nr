@@ -5,4 +5,5 @@ use std::meta::derive;
 pub struct Asset {
     pub oracle: AztecAddress,
     pub ltv: u128,
+    pub active: bool,
 }
