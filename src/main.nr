@@ -38,15 +38,15 @@ pub contract Lending {
     use dep::aztec::hash::compute_secret_hash;
 
     #[contract_library_method]
-    fn MIN_DEBT() -> u128 { 20000000000 } // 200 USD
+    fn UNIT() -> u128 { 1000000000000000000 } // 1e18
     #[contract_library_method]
-    fn UNIT() -> u128 { 100000000 }
+    fn MIN_DEBT() -> u128 { 200 * UNIT() } // 200 USD
     #[contract_library_method]
-    fn LIQUIDATION_BONUS() -> u128 { 110000000 }
+    fn LIQUIDATION_BONUS() -> u128 { (UNIT() * 110) / 100 } // 110 %
     #[contract_library_method]
-    fn CLOSE_FACTOR() -> u128 { 50000000 }
+    fn CLOSE_FACTOR() -> u128 { (UNIT() * 50) / 100 } // 50 %
     #[contract_library_method]
-    fn LIQ_RESERVE_SHARE() -> u128 { 5000000 } // 5%
+    fn LIQ_RESERVE_SHARE() -> u128 { (UNIT() * 5) / 100 } // 5%
 
     // Storage structure, containing all storage, and specifying what slots they use.
     #[storage]
@@ -64,12 +64,15 @@ pub contract Lending {
         loans: Map<Field, PublicMutable<Loan, Context>, Context>, // secret based loan
 
         total_debt: PublicMutable<u128, Context>,
-        current_index: PublicMutable<u128, Context>,
+        current_debt_index: PublicMutable<u128, Context>,
+        current_supply_index: PublicMutable<u128, Context>,
         last_update_ts: PublicMutable<u64, Context>,
         available_base: PublicMutable<u128, Context>,
         reserve: PublicMutable<u128, Context>,
         balances: Map<Field, PublicMutable<Balance, Context>, Context>, // secret based balance, only public
     }
+
+    //TODO public stters, reserve_fee, kink ? ts multip ? 
 
     #[public]
     #[initializer]
@@ -80,8 +83,9 @@ pub contract Lending {
 
         storage.admin.write(context.msg_sender());
 
-        storage.reserve_fee.write(15000000); // 15% on interests
-        storage.current_index.write(100000000); // Initialize debt index at 1
+        storage.reserve_fee.write((UNIT() * 15) / 100); // 15% on interests
+        storage.current_debt_index.write(UNIT()); // Initialize debt index at 1
+        storage.current_supply_index.write(UNIT()); // Initialize supply index at 1
         storage.last_update_ts.write(context.timestamp()); // Initialize ts now
     }
 
@@ -133,10 +137,11 @@ pub contract Lending {
     */
 
     #[public]
-    fn accrue_interest() -> u128 {
+    fn accrue_interest() -> [u128; 2] {
         let current_ts = context.timestamp();
         let delta = current_ts - storage.last_update_ts.read();
-        let mut current_index = storage.current_index.read();
+        let mut current_debt_index = storage.current_debt_index.read();
+        let mut current_supply_index = storage.current_supply_index.read();
 
         if delta > 0 {
             let total_debt = storage.total_debt.read();
@@ -144,19 +149,23 @@ pub contract Lending {
             let BASE_RATE: u128 = 100000000;
 
             // TODO COMPUTE A BORROW RATE
-            let borrow_rate_per_second = BASE_RATE * ((total_debt * UNIT()) / (total_debt + storage.available_base.read()));
+            let utilization_rate = (total_debt * UNIT()) / (total_debt + storage.available_base.read());
+            let borrow_rate_per_second = BASE_RATE * utilization_rate;
             //TODO 
 
             let interest_factor = borrow_rate_per_second * delta as u128;
 
             storage.total_debt.write(total_debt + (interest_factor * total_debt) / UNIT());
-            current_index = current_index + (current_index * interest_factor) / UNIT();
 
-            storage.current_index.write(current_index);
+            current_debt_index = current_debt_index + (current_debt_index * interest_factor) / UNIT();
+            current_supply_index = current_supply_index + ( current_supply_index * (interest_factor * utilization_rate) / UNIT() ) / UNIT();
+
+            storage.current_debt_index.write(current_debt_index);
+            storage.current_supply_index.write(current_supply_index);
             storage.last_update_ts.write(current_ts);
         }
 
-        current_index
+        [current_debt_index, current_supply_index]
     }
     /*
         PRIVATE
@@ -308,15 +317,15 @@ pub contract Lending {
         loan_id: Field,
     ) {
         assert(base_token == storage.base_token.read());
-        let current_index = Lending::at(context.this_address()).accrue_interest().call(&mut context);
+        let current_indexes = Lending::at(context.this_address()).accrue_interest().call(&mut context);
 
         let loan_slot = storage.loans.at(loan_id);
         let mut loan = loan_slot.read();
 
         assert(loan.collateral == collateral);
 
-        loan.debt = (loan.debt * current_index) / loan.last_index - debt;
-        loan.last_index = current_index;
+        loan.debt = (loan.debt * current_indexes[0]) / loan.last_index - debt;
+        loan.last_index = current_indexes[0];
 
         let collateral_asset = storage.collaterals.at(collateral).read();
         let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
@@ -357,13 +366,13 @@ pub contract Lending {
         loan_id: Field,
     ) {
         assert(storage.base_token.read() == base_token);
-        let current_index = Lending::at(context.this_address()).accrue_interest().call(&mut context);
+        let current_indexes = Lending::at(context.this_address()).accrue_interest().call(&mut context);
 
         let loan_slot = storage.loans.at(loan_id);
         let mut loan = loan_slot.read();
 
-        loan.debt = (loan.debt * current_index) / loan.last_index - debt;
-        loan.last_index = current_index;
+        loan.debt = (loan.debt * current_indexes[0]) / loan.last_index - debt;
+        loan.last_index = current_indexes[0];
 
         assert( (loan.debt >= MIN_DEBT()) | (loan.debt == 0) );
 
@@ -396,7 +405,7 @@ pub contract Lending {
         assert(collateral_asset.active);
         assert(base_token == storage.base_token.read());
 
-        let current_index = Lending::at(context.this_address()).accrue_interest().call(&mut context);
+        let current_indexes = Lending::at(context.this_address()).accrue_interest().call(&mut context);
 
         let loan_slot = storage.loans.at(loan_id);
         let mut loan = loan_slot.read();
@@ -404,8 +413,8 @@ pub contract Lending {
         if( (loan.debt > 0) | (loan.collateral_amount > 0) ) {
             assert(loan.collateral == collateral);
 
-            loan.debt = ((loan.debt * current_index) / loan.last_index) + debt_amount;
-            loan.last_index = current_index;
+            loan.debt = ((loan.debt * current_indexes[0]) / loan.last_index) + debt_amount;
+            loan.last_index = current_indexes[0];
 
             loan.collateral_amount += collateral_amount;
 
@@ -417,7 +426,7 @@ pub contract Lending {
         } else {
             assert(debt_amount >= MIN_DEBT());
 
-            loan = Loan {collateral: collateral, collateral_amount: collateral_amount, debt: debt_amount, last_index: current_index};
+            loan = Loan {collateral: collateral, collateral_amount: collateral_amount, debt: debt_amount, last_index: current_indexes[0]};
 
             let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
             assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
@@ -438,8 +447,8 @@ pub contract Lending {
     ) {
         assert(base_token == storage.base_token.read());
 
-        let current_index = Lending::at(context.this_address()).accrue_interest().call(&mut context);
-        Lending::at(context.this_address())._update_balance(user_id, current_index, amount, 0).call(&mut context);
+        let current_indexes = Lending::at(context.this_address()).accrue_interest().call(&mut context);
+        Lending::at(context.this_address())._update_balance(user_id, current_indexes[1], amount, 0).call(&mut context);
     }
 
     #[public]
@@ -451,21 +460,21 @@ pub contract Lending {
     ) {
         assert(base_token == storage.base_token.read());
 
-        let current_index = Lending::at(context.this_address()).accrue_interest().call(&mut context);
-        Lending::at(context.this_address())._update_balance(user_id, current_index, 0, amount).call(&mut context);
+        let current_indexes = Lending::at(context.this_address()).accrue_interest().call(&mut context);
+        Lending::at(context.this_address())._update_balance(user_id, current_indexes[1], 0, amount).call(&mut context);
     }
 
     #[public]
     #[internal]
     fn _update_balance(
         user_id: Field,
-        current_index: u128,
+        current_supply_index: u128,
         to_add: u128,
         to_sub: u128,
     ) {
         let balance_slot = storage.balances.at(user_id);
         let mut balance = balance_slot.read();
-        let mut current_balance = if balance.amount > 0 {(balance.amount * current_index) / balance.last_index } else {0};
+        let mut current_balance = if balance.amount > 0 {(balance.amount * current_supply_index) / balance.last_index } else {0};
 
         let reserve_fee = (storage.reserve_fee.read() * (current_balance - balance.amount)) / UNIT();
 
@@ -475,7 +484,7 @@ pub contract Lending {
         current_balance -= to_sub;
 
         balance.amount = current_balance;
-        balance.last_index = current_index;
+        balance.last_index = current_supply_index;
 
         storage.available_base.write(storage.available_base.read() + to_add - to_sub);
     }
