@@ -1,6 +1,11 @@
 /*
     Could add a smart wallet try to repay function, to avoid liquidations, with incentive for liquidators
 
+    Liquidation:
+        Auction system, with high long term rewards for low collateral bonus
+
+    Should use block number for acounting ?
+
     VIEWS
     SMART ACCOUNTS
     FEE_FOR_OWNER
@@ -13,6 +18,8 @@ mod asset;
 
 use dep::aztec::macros::aztec;
 //TODO ASSUMING 8 decimals
+
+//TODO think about utility of loan_exists
 #[aztec]
 pub contract Lending {
     use dep::aztec::prelude::{AztecAddress, Map, PublicMutable, PublicImmutable};
@@ -101,17 +108,16 @@ pub contract Lending {
         if delta > 0 {
             let total_debt = storage.total_debt.read();
 
-            let UNIT: u128 = 100000000;
             let BASE_RATE: u128 = 100000000;
 
             // TODO COMPUTE A BORROW RATE
-            let borrow_rate_per_second = BASE_RATE * ((total_debt * UNIT) / (total_debt + storage.available_base.read()));
+            let borrow_rate_per_second = BASE_RATE * ((total_debt * UNIT()) / (total_debt + storage.available_base.read()));
             //TODO 
 
             let interest_factor = borrow_rate_per_second * delta as u128;
 
-            storage.total_debt.write(total_debt + (interest_factor * total_debt) / UNIT);
-            current_index = current_index + (current_index * interest_factor) / UNIT;
+            storage.total_debt.write(total_debt + (interest_factor * total_debt) / UNIT());
+            current_index = current_index + (current_index * interest_factor) / UNIT();
 
             storage.current_index.write(current_index);
             storage.last_update_ts.write(current_ts);
@@ -231,9 +237,72 @@ pub contract Lending {
             .enqueue(&mut context);
     }
 
+    #[private]
+    fn liquidate(
+        collateral: AztecAddress,
+        collateral_amount: u128,
+        base_token: AztecAddress,
+        debt: u128, 
+        from: AztecAddress,
+        to: AztecAddress,
+        nonce: Field,
+        loan_id: Field,
+    ) {
+        let _ = Token::at(collateral)
+            .transfer_to_private(to, collateral_amount)
+            .call(&mut context);
+
+        let _ = Token::at(base_token)
+            .transfer_to_public(from, context.this_address(), debt, nonce)
+            .call(&mut context);
+
+        Lending::at(context.this_address())
+            ._liquidate(collateral, collateral_amount, base_token, debt, loan_id)
+            .enqueue(&mut context);
+    }
+
     /*
         INTERNAL
     */
+//todo total debt with accrued, hard to predict
+    #[public]
+    #[internal]
+    fn _liquidate(
+        collateral: AztecAddress,
+        collateral_amount: u128,
+        base_token: AztecAddress,
+        debt: u128,
+        loan_id: Field,
+    ) {
+        assert(base_token == storage.base_token.read());
+        let current_index = Lending::at(context.this_address()).accrue_interest().call(&mut context);
+
+        let loan_slot = storage.loans.at(loan_id);
+        let mut loan = loan_slot.read();
+
+        assert(loan.collateral == collateral);
+
+        loan.debt = (loan.debt * current_index) / loan.last_index - debt;
+
+        let collateral_asset = storage.collaterals.at(collateral).read();
+        let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
+
+        assert(!((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv));
+        loan.debt -= debt;
+        loan.collateral_amount -= collateral_amount;
+
+        // Repay all or make it healthy
+        if(loan.debt != 0){
+            assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
+        }
+
+        //TODO define liquidation bonus both and reserve
+
+        let collateral_eq = (debt * LIQUIDATION_BONUS()) / collateral_price;
+        assert(collateral_amount <= collateral_eq);
+
+        loan_slot.write(loan);
+    }
 
     #[public]
     #[internal]
@@ -260,7 +329,7 @@ pub contract Lending {
 
                 let collateral_asset = storage.collaterals.at(collateral).read();
                 let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
-                assert((loan.debt * 100000000 as u128) / (loan.collateral_amount * collateral_price) > collateral_asset.ltv);
+                assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
 
             }
         }
@@ -296,7 +365,7 @@ pub contract Lending {
 
                 let collateral_asset = storage.collaterals.at(collateral).read();
                 let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
-                assert((loan.debt * 100000000 as u128) / (loan.collateral_amount * collateral_price) > collateral_asset.ltv);
+                assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
 
             loan_slot.write(loan);
 
@@ -305,7 +374,7 @@ pub contract Lending {
 
                 let collateral_asset = storage.collaterals.at(collateral).read();
                 let collateral_price = PriceFeed::at(collateral_asset.oracle).get_price(loan.collateral.to_field()).view(&mut context).price;
-                assert((loan.debt * 100000000 as u128) / (loan.collateral_amount * collateral_price) > collateral_asset.ltv);
+                assert((loan.debt * UNIT()) / (loan.collateral_amount * collateral_price) < collateral_asset.ltv);
 
             storage.loans.at(loan_id).write(loan);
             storage.loan_exists.at(loan_id).write(true);
@@ -349,13 +418,11 @@ pub contract Lending {
         to_add: u128,
         to_sub: u128,
     ) {
-        let UNIT: u128 = 100000000;
-
         let balance_slot = storage.balances.at(user_id);
         let mut balance = balance_slot.read();
         let mut current_balance = if balance.amount > 0 {(balance.amount * current_index) / balance.last_index } else {0};
 
-        let reserve_fee = (storage.reserve_fee.read() * (current_balance - balance.amount)) / UNIT;
+        let reserve_fee = (storage.reserve_fee.read() * (current_balance - balance.amount)) / UNIT();
 
         current_balance = current_balance + to_add - reserve_fee;
 
@@ -367,5 +434,11 @@ pub contract Lending {
 
         storage.available_base.write(storage.available_base.read() + to_add - to_sub);
     }
+
+    #[contract_library_method]
+    fn UNIT() -> u128 { 100000000 }
+    #[contract_library_method]
+    fn LIQUIDATION_BONUS() -> u128 { 110000000 }
+
 
 }
